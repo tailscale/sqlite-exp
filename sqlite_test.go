@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1352,5 +1353,188 @@ func TestDisableFunction(t *testing.T) {
 
 	if _, err := conn.ExecContext(ctx, "SELECT LOWER('Hi')"); err == nil {
 		t.Fatal("Attempting to use the LOWER function after disabling should have failed")
+	}
+}
+
+type connLogger struct {
+	ch         chan []string
+	statements []string
+	panicOnUse bool
+}
+
+func (cl *connLogger) Begin() {
+	if cl.panicOnUse {
+		panic("unexpected connLogger.Begin()")
+	}
+	cl.statements = nil
+}
+
+func (cl *connLogger) Statement(s string) {
+	if cl.panicOnUse {
+		panic("unexpected connLogger.Statement: " + s)
+	}
+	cl.statements = append(cl.statements, s)
+}
+
+func (cl *connLogger) Commit(err error) {
+	if cl.panicOnUse {
+		panic("unexpected connLogger.Commit()")
+	}
+	if err != nil {
+		return
+	}
+	cl.ch <- cl.statements
+}
+
+func (cl *connLogger) Rollback() {
+	if cl.panicOnUse {
+		panic("unexpected connLogger.Rollback()")
+	}
+	cl.statements = nil
+}
+
+func TestConnLogger_writable(t *testing.T) {
+	for _, commit := range []bool{true, false} {
+		doneStatement := "ROLLBACK"
+		if commit {
+			doneStatement = "COMMIT"
+		}
+		t.Run(doneStatement, func(t *testing.T) {
+			ctx := context.Background()
+			ch := make(chan []string, 1)
+			txl := connLogger{ch: ch}
+			makeLogger := func() ConnLogger { return &txl }
+			db := sql.OpenDB(ConnectorWithLogger("file:"+t.TempDir()+"/test.db", nil, nil, makeLogger))
+			configDB(t, db)
+
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec("CREATE TABLE T (x INTEGER)"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec("INSERT INTO T VALUES (?)", 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Query("SELECT x FROM T"); err != nil {
+				t.Fatal(err)
+			}
+			done := tx.Rollback
+			if commit {
+				done = tx.Commit
+			}
+			if err := done(); err != nil {
+				t.Fatal(err)
+			}
+			if !commit {
+				select {
+				case got := <-ch:
+					t.Errorf("unexpectedly logged statements for rollback:\n%s", strings.Join(got, "\n"))
+				default:
+					return
+				}
+			}
+
+			want := []string{
+				"BEGIN IMMEDIATE",
+				"CREATE TABLE T (x INTEGER)",
+				"INSERT INTO T VALUES (1)",
+				doneStatement,
+			}
+			select {
+			case got := <-ch:
+				if !slices.Equal(got, want) {
+					t.Errorf("unexpected log statements. got:\n%s\n\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+				}
+			default:
+				t.Fatal("no logged statements after commit")
+			}
+		})
+	}
+}
+
+func TestConnLogger_commit_error(t *testing.T) {
+	ctx := context.Background()
+	ch := make(chan []string, 1)
+	txl := connLogger{ch: ch}
+	makeLogger := func() ConnLogger { return &txl }
+	db := sql.OpenDB(ConnectorWithLogger("file:"+t.TempDir()+"/test.db", nil, nil, makeLogger))
+	configDB(t, db)
+
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE A (x INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE B (x INTEGER REFERENCES A(X) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO B VALUES (?)", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err == nil {
+		t.Fatal("expected Commit to error, but didn't")
+	}
+	select {
+	case got := <-ch:
+		t.Errorf("unexpectedly logged statements for errored commit:\n%s", strings.Join(got, "\n"))
+	default:
+		return
+	}
+}
+
+func TestConnLogger_read_tx(t *testing.T) {
+	ctx := context.Background()
+	ch := make(chan []string, 1)
+	txl := connLogger{ch: ch}
+	makeLogger := func() ConnLogger { return &txl }
+	db := sql.OpenDB(ConnectorWithLogger("file:"+t.TempDir()+"/test.db", nil, nil, makeLogger))
+	configDB(t, db)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("CREATE TABLE T (x INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO T VALUES (?)", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-ch:
+		if len(got) == 0 {
+			t.Errorf("expected logged statements for write tx")
+		}
+	default:
+		t.Errorf("expected logged statements for write tx")
+	}
+
+	txl.panicOnUse = true
+	for _, commit := range []bool{true, false} {
+		rx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rx.Query("SELECT x FROM T"); err != nil {
+			t.Fatal(err)
+		}
+		done := rx.Rollback
+		if commit {
+			done = rx.Commit
+		}
+		if err := done(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
