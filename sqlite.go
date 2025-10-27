@@ -127,9 +127,22 @@ func Connector(sqliteURI string, connInitFunc ConnInitFunc, tracer sqliteh.Trace
 	}
 }
 
+// ConnectorWithLogger returns a [driver.Connector] for the given connection
+// parameters. makeLogger is used to create a [ConnLogger] when [Connect] is
+// called.
+func ConnectorWithLogger(sqliteURI string, connInitFunc ConnInitFunc, tracer sqliteh.Tracer, makeLogger func() ConnLogger) driver.Connector {
+	return &connector{
+		name:         sqliteURI,
+		tracer:       tracer,
+		makeLogger:   makeLogger,
+		connInitFunc: connInitFunc,
+	}
+}
+
 type connector struct {
 	name         string
 	tracer       sqliteh.Tracer
+	makeLogger   func() ConnLogger // or nil
 	connInitFunc ConnInitFunc
 }
 
@@ -152,11 +165,13 @@ func (p *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		}
 		return nil, err
 	}
-
 	c := &conn{
 		db:     db,
 		tracer: p.tracer,
 		id:     sqliteh.TraceConnID(maxConnID.Add(1)),
+	}
+	if p.makeLogger != nil {
+		c.logger = p.makeLogger()
 	}
 	if p.connInitFunc != nil {
 		if err := p.connInitFunc(ctx, c); err != nil {
@@ -179,6 +194,7 @@ type conn struct {
 	db       sqliteh.DB
 	id       sqliteh.TraceConnID
 	tracer   sqliteh.Tracer
+	logger   ConnLogger
 	stmts    map[string]*stmt // persisted statements
 	txState  txState
 	readOnly bool
@@ -202,6 +218,7 @@ func (c *conn) Close() error {
 	err := reserr(c.db, "Conn.Close", "", c.db.Close())
 	return err
 }
+
 func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	persist := ctx.Value(persistQuery{}) != nil
 	return c.prepare(ctx, query, persist)
@@ -341,6 +358,9 @@ func (c *conn) txInit(ctx context.Context) error {
 			return err
 		}
 	} else {
+		if c.logger != nil {
+			c.logger.Begin()
+		}
 		// TODO(crawshaw): offer BEGIN DEFERRED (and BEGIN CONCURRENT?)
 		// semantics via a context annotation function.
 		if err := c.execInternal(ctx, "BEGIN IMMEDIATE"); err != nil {
@@ -351,15 +371,16 @@ func (c *conn) txInit(ctx context.Context) error {
 }
 
 func (c *conn) txEnd(ctx context.Context, endStmt string) error {
-	state, readOnly := c.txState, c.readOnly
-	c.txState = txStateNone
-	c.readOnly = false
-	if state != txStateBegun {
+	defer func() {
+		c.txState = txStateNone
+		c.readOnly = false
+	}()
+	if c.txState != txStateBegun {
 		return nil
 	}
 
 	err := c.execInternal(context.Background(), endStmt)
-	if readOnly {
+	if c.readOnly {
 		if err2 := c.execInternal(ctx, "PRAGMA query_only=false"); err == nil {
 			err = err2
 		}
@@ -377,9 +398,13 @@ func (tx *connTx) Commit() error {
 		return ErrClosed
 	}
 
+	readonly := tx.conn.readOnly
 	err := tx.conn.txEnd(context.Background(), "COMMIT")
 	if tx.conn.tracer != nil {
 		tx.conn.tracer.Commit(tx.conn.id, err)
+	}
+	if tx.conn.logger != nil && !readonly {
+		tx.conn.logger.Commit(err)
 	}
 	return err
 }
@@ -390,9 +415,13 @@ func (tx *connTx) Rollback() error {
 		return ErrClosed
 	}
 
+	readonly := tx.conn.readOnly
 	err := tx.conn.txEnd(context.Background(), "ROLLBACK")
 	if tx.conn.tracer != nil {
 		tx.conn.tracer.Rollback(tx.conn.id, err)
+	}
+	if tx.conn.logger != nil && !readonly {
+		tx.conn.logger.Rollback()
 	}
 	return err
 }
@@ -489,6 +518,9 @@ func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 	}
 	if err := s.bindAll(args); err != nil {
 		return nil, s.reserr("Stmt.Exec(Bind)", err)
+	}
+	if s.conn.logger != nil && !s.conn.readOnly {
+		s.conn.logger.Statement(s.stmt.ExpandedSQL())
 	}
 
 	if ctx.Value(queryCancelKey{}) != nil {
@@ -1068,3 +1100,25 @@ func WithQueryCancel(ctx context.Context) context.Context {
 
 // queryCancelKey is a context key for query context enforcement.
 type queryCancelKey struct{}
+
+// ConnLogger is implemented by the caller to support statement-level logging
+// for write transactions. Only Exec calls are logged, not Query calls, as this
+// is intended as a mechanism to replay failed transactions.
+//
+// Aside from logging only executed statements, ConnLogger also differs from
+// [sqliteh.Tracer] by logging the expanded SQL, instead of the query with
+// placeholders.
+type ConnLogger interface {
+	// Begin is called when a writable transaction is opened.
+	Begin()
+
+	// Statement is called with evaluated SQL when a statement is executed.
+	Statement(sql string)
+
+	// Commit is called after a commit statement, with the error resulting
+	// from the attempted commit.
+	Commit(error)
+
+	// Rollback is called after a rollback statement.
+	Rollback()
+}
