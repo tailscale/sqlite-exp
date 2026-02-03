@@ -60,7 +60,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tailscale/sqlite/sqliteh"
+	"github.com/tailscale/sqlite-exp/sqliteh"
 )
 
 // emptyChar is the empty string constant used when binding empty strings to
