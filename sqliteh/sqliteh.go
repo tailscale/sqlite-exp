@@ -65,6 +65,9 @@ type DB interface {
 	// function's signature.
 	//
 	DisableFunction(name string, numArgs int) error
+	// FileControlInt is sqlite3_file_control for opcodes that take an
+	// integer argument.
+	FileControlInt(dbName string, op FileControlOp, arg *int) error
 }
 
 // Stmt is an sqlite3_stmt* database connection object.
@@ -350,6 +353,13 @@ func (o OpenFlags) String() string {
 	}
 	return string(flags)
 }
+
+// FileControlOp is an opcode for sqlite3_file_control.
+type FileControlOp int
+
+const (
+	SQLITE_FCNTL_RESERVE_BYTES FileControlOp = 38
+)
 
 // Checkpoint is a WAL checkpoint mode.
 // It is used by sqlite3_wal_checkpoint_v2.

@@ -10,7 +10,9 @@ import (
 	"database/sql/driver"
 	"expvar"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
@@ -1623,5 +1625,67 @@ func TestExpandedSQL(t *testing.T) {
 
 	if got, want := stmt.stmt.ExpandedSQL(), "SELECT 6 + 7"; got != want {
 		t.Errorf("wrong sql: got %q, want %q", got, want)
+	}
+}
+
+func TestFileControlReserveBytes(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := sql.Open("sqlite3", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO t (id) VALUES (1);"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := GetReserveBytes(conn, "main"); err != nil {
+		t.Fatal(err)
+	} else if got != 0 {
+		t.Fatalf("initial reserved bytes=%d, want 0", got)
+	}
+
+	reserve := 16
+	if err := SetReserveBytes(conn, "", reserve); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ExecScript(conn, "VACUUM;"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := GetReserveBytes(conn, "main"); err != nil {
+		t.Fatal(err)
+	} else if got != reserve {
+		t.Fatalf("reserved bytes=%d, want %d", got, reserve)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	header := make([]byte, 100)
+	file, err := os.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := io.ReadFull(file, header); err != nil {
+		t.Fatal(err)
+	}
+	if got := int(header[20]); got != reserve {
+		t.Fatalf("reserved bytes header=%d, want %d", got, reserve)
 	}
 }
