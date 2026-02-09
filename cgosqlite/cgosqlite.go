@@ -227,6 +227,21 @@ func (db *DB) DisableFunction(name string, numArgs int) error {
 	return errCode(C.ts_sqlite3_disable_function(db.db, cName, C.int(numArgs)))
 }
 
+func (db *DB) FileControlInt(dbName string, op sqliteh.FileControlOp, arg *int) error {
+	var cDB *C.char
+	if dbName != "" {
+		cDB = C.CString(dbName)
+		defer C.free(unsafe.Pointer(cDB))
+	}
+	if arg == nil {
+		return errCode(C.sqlite3_file_control(db.db, cDB, C.int(op), nil))
+	}
+	cArg := C.int(*arg)
+	res := C.sqlite3_file_control(db.db, cDB, C.int(op), unsafe.Pointer(&cArg))
+	*arg = int(cArg)
+	return errCode(res)
+}
+
 func (stmt *Stmt) DBHandle() sqliteh.DB {
 	cdb := C.sqlite3_db_handle(stmt.stmt)
 	if cdb != nil {

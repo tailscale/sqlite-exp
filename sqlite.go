@@ -1134,6 +1134,35 @@ func DisableFunction(sqlconn SQLConn, name string, numArgs int) error {
 	})
 }
 
+// fileControlInt calls sqlite3_file_control on the underlying connection.
+func fileControlInt(sqlconn SQLConn, dbName string, op sqliteh.FileControlOp, arg *int) error {
+	return sqlconn.Raw(func(driverConn any) error {
+		c, ok := driverConn.(*conn)
+		if !ok {
+			return fmt.Errorf("sqlite.FileControl: sql.Conn is not the sqlite driver: %T", driverConn)
+		}
+		return c.db.FileControlInt(dbName, op, arg)
+	})
+}
+
+// SetReserveBytes sets the number of reserved bytes at the end of each
+// database page, using sqlite3_file_control with SQLITE_FCNTL_RESERVE_BYTES opcode.
+func SetReserveBytes(sqlconn SQLConn, dbName string, bytes int) error {
+	if bytes < 0 || bytes > 255 {
+		return fmt.Errorf("reserved bytes must be between 0 and 255, got %d", bytes)
+	}
+	return fileControlInt(sqlconn, dbName, sqliteh.SQLITE_FCNTL_RESERVE_BYTES, &bytes)
+}
+
+// GetReserveBytes gets the number of reserved bytes at the end of each
+// database page.
+func GetReserveBytes(sqlconn SQLConn, dbName string) (int, error) {
+	var bytes int
+	bytes = -1 // pass a negative value to query the current setting.
+	err := fileControlInt(sqlconn, dbName, sqliteh.SQLITE_FCNTL_RESERVE_BYTES, &bytes)
+	return bytes, err
+}
+
 // WithPersist makes a ctx instruct the sqlite driver to persist a prepared query.
 //
 // This should be used with recurring queries to avoid constant parsing and
